@@ -56,19 +56,33 @@ def tratamento_duplicatas(df):
     return df
 
 def padronização_dados(df):
-    df['pais'] = unidecode(df['pais']).str.upper().str.strip()
-    df['estado'] = unidecode(df['estado']).str.upper().str.strip()
-    df['ncm'] = unidecode(df['ncm']).str.upper().str.strip()
-    df['bloco_economico'] = unidecode(df['bloco_economico']).str.upper().str.strip()
-    df['via'] = unidecode(df['via']).str.upper().str.strip()
-    df['urf'] = unidecode(df['urf']).str.upper().str.strip()
-    return df
 
+    colunas = [
+        'pais',
+        'estado',
+        'ncm',
+        'bloco_economico',
+        'via',
+        'urf'
+    ]
+
+    for coluna in colunas:
+        df[coluna] = (
+            df[coluna]
+            .astype(str)
+            .map(unidecode)
+            .str.upper()
+            .str.strip()
+        )
+
+    return df
+    
 def cleaning(df):
     df = coluna_snake_case(df)
     df = tipificação_dados(df)
     df = tratamento_duplicatas(df)
     df = padronização_dados(df)
+    print("Dados limpos com sucesso.")
     return df    
 
     

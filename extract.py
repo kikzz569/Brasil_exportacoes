@@ -8,6 +8,10 @@ from io import BytesIO
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
+BUCKET_NAME = 'dados_por_ano'
+FOLDER_RAW = 'raw'
+FOLDER_LOGS = 'logs'
+
 #carregando as variáveis do arquivo .env e inicializando a conexão com o banco de dados supabase
 load_dotenv()
 
@@ -122,7 +126,7 @@ def extrair_dados(ano_inicial, ano_final):
  
                         if status == 429:
                             retry_after = e.response.headers.get('Retry-After') if e.response is not None else None
-                            espera = int(retry_after) if retry_after else 30 * (tentativas + 1)
+                            espera = int(retry_after) if retry_after else 10 * (tentativas + 1)
                             print(f'Rate limit (429) no mês {mes} — aguardando {espera}s (tentativa {tentativas+1})')
                             time.sleep(espera)
                         else:
@@ -168,7 +172,7 @@ def extrair_dados(ano_inicial, ano_final):
                 }).encode()).getvalue(),
                 file_options={"content-type": "application/json", "upsert": "true"}
             )
-            print(f"Arquivo JSON enviado para o Supabase em: logs/log_raw_dados_{ano}.json")
+            print(f"Arquivo JSON enviado para o Supabase em: logs/{nome_arquivo_log}")
 
             yield ano, data
 

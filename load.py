@@ -2,6 +2,10 @@
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 import os
+import requests
+import pandas as pd
+import io
+import csv
 
 load_dotenv()
 
@@ -22,10 +26,10 @@ def tabelas_auxiliares():
     for tabela in tabelas:
         
         url = f'https://api-comexstat.mdic.gov.br/{tabela}' 
-        resp = requests.post(url, json=payload, headers=headers, params=querystring, timeout=60)
+        resp = requests.get(url, timeout=60)
         resp.raise_for_status()
-        resp = pd.DataFrame(resp.json()['data']['list'])
-        resp.to_sql(
+        df = pd.DataFrame(resp.json()['data']['list'])
+        df.to_sql(
             name=tabela,
             con=engine,
             schema='staging',
@@ -33,19 +37,85 @@ def tabelas_auxiliares():
             index=False
         )   
     
-def carregar_staging(df, anos_existentes):
-    ano = df['ano'].iloc[0]
+def carregar_staging(df, anos_existentes, chunk_size=100_000):
+
+    ano = int(df["ano"].iloc[0])
 
     if ano in anos_existentes:
-        print(f'[LOAD] Ano {ano} já carregado, pulando...')
+        print(f"[LOAD] Ano {ano} já carregado.")
         return
 
-    df.to_sql(
-        name='comex_staging',
-        con=engine,
-        schema='staging',
-        if_exists='append',
-        index=False
-    )
-    anos_existentes.add(ano)
-    print(f'[LOAD] Ano {ano} → {len(df):,} linhas inseridas')
+    colunas = ",".join(df.columns)
+
+    sql = f"""
+        COPY staging.comex_staging ({colunas})
+        FROM STDIN
+        WITH (
+            FORMAT CSV,
+            DELIMITER ',',
+            NULL '\\N'
+        )
+    """
+
+    total = len(df)
+
+    conn = engine.raw_connection()
+    cur = conn.cursor()
+
+    try:
+        for inicio in range(0, total, chunk_size):
+
+            fim = min(inicio + chunk_size, total)
+
+            tentativas = 5
+
+            for tentativa in range(1, tentativas + 1):
+
+                try:
+
+                    print(
+                        f"[LOAD] Lote {inicio:,} → {fim:,} "
+                        f"(tentativa {tentativa}/{tentativas})"
+                    )
+
+                    buffer = io.StringIO()
+
+                    df.iloc[inicio:fim].to_csv(
+                        buffer,
+                        index=False,
+                        header=False,
+                        sep=",",
+                        quoting=csv.QUOTE_MINIMAL,
+                        na_rep="\\N"
+                    )
+
+                    buffer.seek(0)
+
+                    cur.copy_expert(sql, buffer)
+
+                    conn.commit()
+
+                    break
+
+                except Exception as e:
+
+                    conn.rollback()
+
+                    print(f"[ERRO] {e}")
+
+                    if tentativa == tentativas:
+                        raise
+
+                    espera = 5 * tentativa
+
+                    print(f"Nova tentativa em {espera}s...")
+
+                    time.sleep(espera)
+
+        anos_existentes.add(ano)
+
+        print(f"[LOAD] Ano {ano} carregado com sucesso.")
+
+    finally:
+        cur.close()
+        conn.close()
