@@ -1,5 +1,5 @@
 # app.py
-from extract import extrair_dados, carregar_dados
+from extract import extrair_dados
 from cleaning import cleaning
 from load import carregar_staging, anos_ja_carregados
 from datetime import date

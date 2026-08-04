@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 import io
 import csv
+import time
 
 load_dotenv()
 
@@ -38,7 +39,6 @@ def tabelas_auxiliares():
         )   
     
 def carregar_staging(df, anos_existentes, chunk_size=100_000):
-
     ano = int(df["ano"].iloc[0])
 
     if ano in anos_existentes:
@@ -46,76 +46,54 @@ def carregar_staging(df, anos_existentes, chunk_size=100_000):
         return
 
     colunas = ",".join(df.columns)
-
     sql = f"""
         COPY staging.comex_staging ({colunas})
         FROM STDIN
-        WITH (
-            FORMAT CSV,
-            DELIMITER ',',
-            NULL '\\N'
-        )
+        WITH (FORMAT CSV, DELIMITER ',', NULL '\\N')
     """
 
     total = len(df)
 
-    conn = engine.raw_connection()
-    cur = conn.cursor()
+    for inicio in range(0, total, chunk_size):
+        fim = min(inicio + chunk_size, total)
 
-    try:
-        for inicio in range(0, total, chunk_size):
+        for tentativa in range(1, 6):
+            conn = None
+            try:
+                print(f"[LOAD] Lote {inicio:,} → {fim:,} (tentativa {tentativa}/5)")
 
-            fim = min(inicio + chunk_size, total)
+                conn = engine.raw_connection()
+                cur = conn.cursor()
 
-            tentativas = 5
+                buffer = io.StringIO()
+                df.iloc[inicio:fim].to_csv(
+                    buffer,
+                    index=False,
+                    header=False,
+                    sep=",",
+                    quoting=csv.QUOTE_MINIMAL,
+                    na_rep="\\N"
+                )
+                buffer.seek(0)
 
-            for tentativa in range(1, tentativas + 1):
+                cur.copy_expert(sql, buffer)
+                conn.commit()
+                cur.close()
+                conn.close()
+                break
 
-                try:
+            except Exception as e:
+                if conn:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                print(f"[ERRO] {e}")
+                if tentativa == 5:
+                    raise
+                espera = 5 * tentativa
+                print(f"Nova tentativa em {espera}s...")
+                time.sleep(espera)
 
-                    print(
-                        f"[LOAD] Lote {inicio:,} → {fim:,} "
-                        f"(tentativa {tentativa}/{tentativas})"
-                    )
-
-                    buffer = io.StringIO()
-
-                    df.iloc[inicio:fim].to_csv(
-                        buffer,
-                        index=False,
-                        header=False,
-                        sep=",",
-                        quoting=csv.QUOTE_MINIMAL,
-                        na_rep="\\N"
-                    )
-
-                    buffer.seek(0)
-
-                    cur.copy_expert(sql, buffer)
-
-                    conn.commit()
-
-                    break
-
-                except Exception as e:
-
-                    conn.rollback()
-
-                    print(f"[ERRO] {e}")
-
-                    if tentativa == tentativas:
-                        raise
-
-                    espera = 5 * tentativa
-
-                    print(f"Nova tentativa em {espera}s...")
-
-                    time.sleep(espera)
-
-        anos_existentes.add(ano)
-
-        print(f"[LOAD] Ano {ano} carregado com sucesso.")
-
-    finally:
-        cur.close()
-        conn.close()
+    anos_existentes.add(ano)
+    print(f"[LOAD] Ano {ano} carregado com sucesso.")

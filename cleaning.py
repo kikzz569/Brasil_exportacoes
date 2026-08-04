@@ -10,7 +10,6 @@ def coluna_snake_case(df):
         'monthNumber': 'mes_numero',
         'country': 'pais',
         'state': 'estado',
-        'ncm': 'ncm',
         'economicBlock': 'bloco_economico',
         'via': 'via',
         'urf': 'urf',
