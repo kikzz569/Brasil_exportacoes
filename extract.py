@@ -64,33 +64,45 @@ def extrair_dados(ano_inicial, ano_final):
         resp.raise_for_status()
         return resp.json()
 
-    #códigos de UF (padrão IBGE, 2 dígitos) - fixos, sem depender de chamada à API
-    CODIGOS_UF = [
-        11, 12, 13, 14, 15, 16, 17,          # Norte
-        21, 22, 23, 24, 25, 26, 27, 28, 29,  # Nordeste
-        31, 32, 33, 35,                      # Sudeste
-        41, 42, 43,                          # Sul
-        50, 51, 52, 53,                      # Centro-Oeste
+    #códigos de bloco econômico conforme a própria API do ComexStat retorna em /economicBlock (ou similar).
+    #são só 12 blocos, bem menos chamadas que particionar por UF (34). Nota: blocos se sobrepõem
+    #(ex: Argentina está em "Mercosul" E "América do Sul"), então o mesmo registro aparece em mais
+    #de uma partição - isso já é tratado no cleaning.py, que deduplica sem usar bloco_economico na chave.
+    CODIGOS_BLOCO = [
+        105,  # América Central e Caribe
+        107,  # América do Norte
+        48,   # América do Sul
+        53,   # Associação de Nações do Sudeste Asiático - ASEAN
+        27,   # Comunidade Andina das Nações - CAN
+        112,  # Europa
+        111,  # Mercado Comum do Sul - Mercosul
+        61,   # Oceania
+        41,   # Oriente Médio
+        22,   # União Europeia - UE
+        51,   # África
+        39,   # Ásia (Exclusive Oriente Médio)
     ]
 
-    #quando o mês inteiro dá 500 (timeout de volume - "fullResults"), particiona por UF.
-    #mantém os MESMOS details, só reduz o volume por chamada. Sem retry: se uma UF falhar, pula pra próxima.
-    def baixar_mes_particionado_por_uf(ano, mes, details, metrics):
-        print(f'  Particionando mês {mes}/{ano} por UF (fallback de volume)')
-        dfs_uf = []
+    #quando o mês inteiro dá 500 (timeout de volume - "fullResults"), particiona por bloco econômico.
+    #mantém os MESMOS details, só reduz o volume por chamada. Sem retry em erros que não sejam 429/502.
+    def baixar_mes_particionado_por_bloco(ano, mes, details, metrics):
+        print(f'  Particionando mês {mes}/{ano} por bloco econômico (fallback de volume)')
+        dfs_bloco = []
 
-        for co_uf in CODIGOS_UF:
+        for co_bloco in CODIGOS_BLOCO:
             for tentativa in range(6):
                 try:
                     data = source(
                         'export',
                         f'{ano}-{mes}', f'{ano}-{mes}',
                         details, metrics,
-                        filters=[{"filter": "state", "values": [co_uf]}]
+                        filters=[{"filter": "economicBlock", "values": [co_bloco]}]
                     )
                     if data and data.get('data') and data['data'].get('list'):
-                        dfs_uf.append(pd.DataFrame(data['data']['list']))
-                        print(f'    UF {co_uf} baixada com sucesso')
+                        dfs_bloco.append(pd.DataFrame(data['data']['list']))
+                        print(f'    Bloco {co_bloco} baixado com sucesso ({len(data["data"]["list"])} linhas)')
+                    else:
+                        print(f'    Bloco {co_bloco}: resposta OK, mas sem dados nesse mês (lista vazia)')
                     break
                 except requests.exceptions.HTTPError as e:
                     status = getattr(e.response, 'status_code', None) if e.response is not None else None
@@ -99,31 +111,41 @@ def extrair_dados(ano_inicial, ano_final):
                         #429 é rate limit, é esperado com várias chamadas seguidas - continua tentando
                         retry_after = e.response.headers.get('Retry-After') if e.response is not None else None
                         espera = int(retry_after) if retry_after else 10 * (tentativa + 1)
-                        print(f'    UF {co_uf} rate limit (429) — aguardando {espera}s (tentativa {tentativa+1}/6)')
+                        print(f'    Bloco {co_bloco} rate limit (429) — aguardando {espera}s (tentativa {tentativa+1}/6)')
                         time.sleep(espera)
-                        if tentativa == 9:
-                            print(f'    UF {co_uf} esgotou tentativas de 429 — pulando')
+                        if tentativa == 5:
+                            print(f'    Bloco {co_bloco} esgotou tentativas de 429 — pulando')
                         continue
 
-                    #demais erros (incluindo 500 pontual numa UF específica): sem retry, pula direto
+                    #502 do Cloudflare = origem sobrecarregada, momentâneo - o próprio corpo diz "retryable"
                     corpo_erro = None
                     if e.response is not None:
                         try:
                             corpo_erro = e.response.json()
                         except Exception:
                             corpo_erro = e.response.text[:300]
-                    print(f'    UF {co_uf} falhou (status {status}) — corpo: {corpo_erro} — pulando, sem retry')
+
+                    if status == 502 and isinstance(corpo_erro, dict) and corpo_erro.get('retryable'):
+                        espera = corpo_erro.get('retry_after', 60 * (tentativa + 1))
+                        print(f'    Bloco {co_bloco} 502 (origem sobrecarregada) — aguardando {espera}s (tentativa {tentativa+1}/6)')
+                        time.sleep(espera)
+                        if tentativa == 5:
+                            print(f'    Bloco {co_bloco} esgotou tentativas de 502 — pulando')
+                        continue
+
+                    #demais erros (incluindo 500 pontual num bloco específico): sem retry, pula direto
+                    print(f'    Bloco {co_bloco} falhou (status {status}) — corpo: {corpo_erro} — pulando, sem retry')
                     break
                 except Exception as e:
-                    print(f'    UF {co_uf} falhou com erro inesperado: {e} — pulando, sem retry')
+                    print(f'    Bloco {co_bloco} falhou com erro inesperado: {e} — pulando, sem retry')
                     break
 
-        if not dfs_uf:
+        if not dfs_bloco:
             print(f'  Particionamento do mês {mes} não retornou nenhum dado')
             return None
 
-        print(f'  Mês {mes} recuperado via particionamento por UF ({len(dfs_uf)}/{len(CODIGOS_UF)} UFs)')
-        return pd.concat(dfs_uf, ignore_index=True)
+        print(f'  Mês {mes} recuperado via particionamento por bloco econômico ({len(dfs_bloco)}/{len(CODIGOS_BLOCO)} blocos)')
+        return pd.concat(dfs_bloco, ignore_index=True)
 
     #configuração do local onde o arquivo será salvo.
     OUTPUT_DIR = 'dados/raw'
@@ -218,9 +240,9 @@ def extrair_dados(ano_inicial, ano_final):
                         print(f'Erro ao baixar mês {mes}')
                         break
 
-                #se a consulta cheia falhou com 500 (volume), particiona por UF mantendo os mesmos details
+                #se a consulta cheia falhou com 500 (volume), particiona por bloco econômico mantendo os mesmos details
                 if not mes_recuperado and ultimo_status == 500:
-                    mes_df = baixar_mes_particionado_por_uf(ano, mes, DETAILS, METRICS)
+                    mes_df = baixar_mes_particionado_por_bloco(ano, mes, DETAILS, METRICS)
                     if mes_df is not None:
                         dfs_do_ano.append(mes_df)
                         print(f'DataFrame criado com {len(mes_df.columns)} colunas (via particionamento)')
