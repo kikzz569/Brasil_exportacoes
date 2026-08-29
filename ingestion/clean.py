@@ -1,8 +1,12 @@
+"""Aplica somente a limpeza técnica necessária antes da carga no staging."""
+
 import pandas as pd
 from unidecode import unidecode
 
+from .progress import registrar_progresso
 
-#transformando os nomes das colunas.
+
+# Renomeia as colunas da API para o padrão adotado no staging.
 def coluna_snake_case(df):
     df.rename(columns={
         'coNcm': 'codigo_ncm',
@@ -19,6 +23,7 @@ def coluna_snake_case(df):
     }, inplace=True)
     return df
 
+# Converte colunas para os tipos esperados pela tabela de staging.
 def tipificação_dados(df):
     try:
         df['codigo_ncm'] = df['codigo_ncm'].astype(str)
@@ -29,16 +34,17 @@ def tipificação_dados(df):
         df['quantidade_estatistica'] = df['quantidade_estatistica'].astype(float)
         df['data'] = pd.to_datetime(df['ano'].astype(str) + '-' + df['mes_numero'].astype(str))
     except TypeError as e:
-        print(f'Erro ao tipificar os dados: {e}')
+        registrar_progresso("CLEAN", f"Erro ao tipificar os dados: {e}", "ERRO")
         raise e
     except ValueError as e:
-        print(f'Erro ao tipificar os dados: {e}')
+        registrar_progresso("CLEAN", f"Erro ao tipificar os dados: {e}", "ERRO")
         raise e
     except Exception as e:
-        print(f'Erro ao tipificar os dados: {e}')
-        raise e 
+        registrar_progresso("CLEAN", f"Erro ao tipificar os dados: {e}", "ERRO")
+        raise e
     return df
 
+# Normaliza blocos sobrepostos e remove registros duplicados entre partições.
 def tratamento_duplicatas(df):
 
     mapa = {
@@ -54,6 +60,7 @@ def tratamento_duplicatas(df):
     df = df.drop_duplicates(subset=chave)
     return df
 
+# Padroniza os campos textuais usados na ingestão.
 def padronização_dados(df):
 
     colunas = [
@@ -75,13 +82,12 @@ def padronização_dados(df):
         )
 
     return df
-    
-def cleaning(df):
+
+# Encadeia as rotinas de limpeza técnica antes da carga.
+def limpar_dados(df):
     df = coluna_snake_case(df)
     df = tipificação_dados(df)
     df = tratamento_duplicatas(df)
     df = padronização_dados(df)
-    print("Dados limpos com sucesso.")
-    return df    
-
-    
+    registrar_progresso("CLEAN", "Dados limpos com sucesso")
+    return df

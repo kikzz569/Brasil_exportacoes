@@ -1,3 +1,5 @@
+"""Extrai dados do ComexStat e persiste a camada bruta da pipeline de ingestão."""
+
 import requests
 import time
 import pandas as pd
@@ -8,13 +10,16 @@ from io import BytesIO
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
+from .progress import registrar_progresso
+
 BUCKET_NAME = 'dados_por_ano'
 FOLDER_RAW = 'raw'
 FOLDER_LOGS = 'logs'
 
-#carregando as variáveis do arquivo .env e inicializando a conexão com o banco de dados supabase
+# Carrega a configuração local usada para acessar os serviços do Supabase.
 load_dotenv()
 
+# Cria o cliente usado para acessar o armazenamento do Supabase.
 def conexão_supabase():
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_KEY")
@@ -23,7 +28,7 @@ def conexão_supabase():
 
 supabase = conexão_supabase()
 
-#função para carregar os dados brutos do bucket
+# Recupera sequencialmente os arquivos Parquet existentes na camada raw.
 def carregar_dados():
     arquivos = supabase.storage.from_(BUCKET_NAME).list(FOLDER_RAW)
     for file in arquivos:
@@ -32,12 +37,12 @@ def carregar_dados():
             df = pd.read_parquet(BytesIO(res))
             yield df
 
-#criando função para app.py
+# Extrai da API os anos ausentes e persiste cada resultado anual na camada raw.
 def extrair_dados(ano_inicial, ano_final):
-    # 1. Obter o link da API
+    # Define o endpoint de extração geral do ComexStat.
     url = "https://api-comexstat.mdic.gov.br/general"
 
-    #definindo os parametro para acesso a API
+    # Define idioma e cabeçalhos enviados em cada requisição.
     querystring = {"language":"pt"}
 
     headers = {
@@ -45,7 +50,7 @@ def extrair_dados(ano_inicial, ano_final):
         "Accept": "application/json"
     }
 
-    #definindo a função para acessar a API (filters é opcional, usado no particionamento por estado)
+    # Executa uma consulta à API com filtros opcionais para particionamento por bloco.
     def source(flow, period_from, period_to, details, metrics, filters=None):
         payload = {
             "flow": flow,
@@ -59,15 +64,12 @@ def extrair_dados(ano_inicial, ano_final):
             "metrics": metrics
         }
 
-        #Fazendo a requisição para a API (timeout evita que a requisição fique aberta por mais de 60 segundos em caso de erro)
+        # Limita a requisição a 60 segundos para evitar conexões indefinidamente abertas.
         resp = requests.post(url, json=payload, headers=headers, params=querystring, timeout=60)
         resp.raise_for_status()
         return resp.json()
 
-    #códigos de bloco econômico conforme a própria API do ComexStat retorna em /economicBlock (ou similar).
-    #são só 12 blocos, bem menos chamadas que particionar por UF (34). Nota: blocos se sobrepõem
-    #(ex: Argentina está em "Mercosul" E "América do Sul"), então o mesmo registro aparece em mais
-    #de uma partição - isso já é tratado no cleaning.py, que deduplica sem usar bloco_economico na chave.
+    # Lista os blocos econômicos usados para reduzir o volume das consultas que falham com erro 500.
     CODIGOS_BLOCO = [
         105,  # América Central e Caribe
         107,  # América do Norte
@@ -83,10 +85,9 @@ def extrair_dados(ano_inicial, ano_final):
         39,   # Ásia (Exclusive Oriente Médio)
     ]
 
-    #quando o mês inteiro dá 500 (timeout de volume - "fullResults"), particiona por bloco econômico.
-    #mantém os MESMOS details, só reduz o volume por chamada. Sem retry em erros que não sejam 429/502.
+    # Particiona meses volumosos por bloco, mantendo detalhes e métricas da consulta original.
     def baixar_mes_particionado_por_bloco(ano, mes, details, metrics):
-        print(f'  Particionando mês {mes}/{ano} por bloco econômico (fallback de volume)')
+        registrar_progresso("EXTRACT", f"Particionando mês {mes}/{ano} por bloco econômico (fallback de volume)", "AVISO")
         dfs_bloco = []
 
         for co_bloco in CODIGOS_BLOCO:
@@ -100,24 +101,24 @@ def extrair_dados(ano_inicial, ano_final):
                     )
                     if data and data.get('data') and data['data'].get('list'):
                         dfs_bloco.append(pd.DataFrame(data['data']['list']))
-                        print(f'    Bloco {co_bloco} baixado com sucesso ({len(data["data"]["list"])} linhas)')
+                        registrar_progresso("EXTRACT", f'Bloco {co_bloco} baixado com sucesso ({len(data["data"]["list"])} linhas)')
                     else:
-                        print(f'    Bloco {co_bloco}: resposta OK, mas sem dados nesse mês (lista vazia)')
+                        registrar_progresso("EXTRACT", f"Bloco {co_bloco}: resposta OK, mas sem dados nesse mês")
                     break
                 except requests.exceptions.HTTPError as e:
                     status = getattr(e.response, 'status_code', None) if e.response is not None else None
 
                     if status == 429:
-                        #429 é rate limit, é esperado com várias chamadas seguidas - continua tentando
+                        # Repete erros 429 conforme o Retry-After informado pela API.
                         retry_after = e.response.headers.get('Retry-After') if e.response is not None else None
                         espera = int(retry_after) if retry_after else 10 * (tentativa + 1)
-                        print(f'    Bloco {co_bloco} rate limit (429) — aguardando {espera}s (tentativa {tentativa+1}/6)')
+                        registrar_progresso("EXTRACT", f"Bloco {co_bloco} com rate limit (429); aguardando {espera}s (tentativa {tentativa+1}/6)", "AVISO")
                         time.sleep(espera)
                         if tentativa == 5:
-                            print(f'    Bloco {co_bloco} esgotou tentativas de 429 — pulando')
+                            registrar_progresso("EXTRACT", f"Bloco {co_bloco} esgotou tentativas de 429; pulando", "ERRO")
                         continue
 
-                    #502 do Cloudflare = origem sobrecarregada, momentâneo - o próprio corpo diz "retryable"
+                    # Repete erros 502 quando o Cloudflare identifica a falha como transitória.
                     corpo_erro = None
                     if e.response is not None:
                         try:
@@ -127,102 +128,100 @@ def extrair_dados(ano_inicial, ano_final):
 
                     if status == 502 and isinstance(corpo_erro, dict) and corpo_erro.get('retryable'):
                         espera = corpo_erro.get('retry_after', 60 * (tentativa + 1))
-                        print(f'    Bloco {co_bloco} 502 (origem sobrecarregada) — aguardando {espera}s (tentativa {tentativa+1}/6)')
+                        registrar_progresso("EXTRACT", f"Bloco {co_bloco} com 502 retryable; aguardando {espera}s (tentativa {tentativa+1}/6)", "AVISO")
                         time.sleep(espera)
                         if tentativa == 5:
-                            print(f'    Bloco {co_bloco} esgotou tentativas de 502 — pulando')
+                            registrar_progresso("EXTRACT", f"Bloco {co_bloco} esgotou tentativas de 502; pulando", "ERRO")
                         continue
 
-                    #demais erros (incluindo 500 pontual num bloco específico): sem retry, pula direto
-                    print(f'    Bloco {co_bloco} falhou (status {status}) — corpo: {corpo_erro} — pulando, sem retry')
+                    # Interrompe a partição atual para os demais erros HTTP, sem nova tentativa.
+                    registrar_progresso("EXTRACT", f"Bloco {co_bloco} falhou (status {status}); corpo: {corpo_erro}; pulando sem retry", "ERRO")
                     break
                 except Exception as e:
-                    print(f'    Bloco {co_bloco} falhou com erro inesperado: {e} — pulando, sem retry')
+                    registrar_progresso("EXTRACT", f"Bloco {co_bloco} falhou com erro inesperado: {e}; pulando sem retry", "ERRO")
                     break
 
         if not dfs_bloco:
-            print(f'  Particionamento do mês {mes} não retornou nenhum dado')
+            registrar_progresso("EXTRACT", f"Particionamento do mês {mes} não retornou dados", "AVISO")
             return None
 
-        print(f'  Mês {mes} recuperado via particionamento por bloco econômico ({len(dfs_bloco)}/{len(CODIGOS_BLOCO)} blocos)')
+        registrar_progresso("EXTRACT", f"Mês {mes} recuperado por bloco econômico ({len(dfs_bloco)}/{len(CODIGOS_BLOCO)} blocos)")
         return pd.concat(dfs_bloco, ignore_index=True)
 
-    #configuração do local onde o arquivo será salvo.
+    # Mantém o diretório local previsto para a camada raw.
     OUTPUT_DIR = 'dados/raw'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    #iniciando a requisição mês a mês para não estourar o tempo limite de 30 segundos.
+    # Divide a extração por mês para limitar o volume de cada consulta.
     resultado = []
-    meses = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12']    
+    meses = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12']
     anos = range(ano_inicial, ano_final+1)
 
-    #função para verificar se o arquivo já existe no bucket.
+    # Verifica se um artefato já existe no bucket informado.
     def arquivo_existe_no_bucket(pasta, nome_arquivo, bucket_name):
         arquivos = supabase.storage.from_(bucket_name).list(pasta)
         return any(a['name'] == nome_arquivo for a in arquivos)
 
-    #loop para iterar sobre os anos e meses.
-    for ano in anos:    
-        
-        #definindo o nome dos arquivos.
+    # Percorre cada ano solicitado para criar um artefato Parquet independente.
+    for ano in anos:
+
+        # Define os nomes idempotentes dos artefatos anuais.
         nome_arquivo_data = f'raw_dados_{ano}.parquet'
         nome_arquivo_log = f'log_{ano}.json'
 
-        #verificando se o arquivo já existe no bucket.
+        # Ignora anos que já possuem dados ou log no armazenamento.
         if arquivo_existe_no_bucket('raw', nome_arquivo_data, 'dados_por_ano') or \
             arquivo_existe_no_bucket('logs', nome_arquivo_log, 'logs'):
-            print(f'Ano {ano} já existe no bucket, pulando')
+            registrar_progresso("EXTRACT", f"Ano {ano} já existe no bucket; pulando")
             continue
 
         dfs_do_ano = []
         try:
-            #iterando sobre os meses.
+            # Percorre os meses do ano preservando os detalhes e métricas da consulta.
             for mes in meses:
                 DETAILS = ['country', 'state', 'ncm', 'economicBlock', 'via', 'urf']
                 METRICS = ['metricFOB', 'metricKG', 'metricStatistic']
                 ultimo_status = None
                 mes_recuperado = False
 
-                #tentativas para acessar a API
+                # Tenta obter o mês completo antes de acionar o particionamento.
                 for tentativas in range(10):
                     try:
-                        #definindo os paramentros para a função source.
-                        #flow: export, period: ano-mes, details: país, estado, ncm, bloco econômico, via,urf, metrics: FOB, KG,Statistic.
+                        # Consulta exportações mensais com todas as dimensões e métricas necessárias ao staging.
                         data = source(
                             'export',
-                            str(ano)+'-'+mes, str(ano)+'-'+mes, 
+                            str(ano)+'-'+mes, str(ano)+'-'+mes,
                             DETAILS,
                             METRICS)
 
-                        #verificando se a resposta da API está vazia.
+                        # Trata respostas sem a estrutura de dados esperada como erro HTTP.
                         if not data or 'data' not in data or data.get('data') is None:
                             raise requests.exceptions.HTTPError
 
-                        #adicionando os dados na lista resultado.
+                        # Acumula a resposta e o DataFrame mensal para formar o arquivo anual.
                         resultado.append(data)
-                        print(f'Mês {mes} baixado com sucesso')
+                        registrar_progresso("EXTRACT", f"Mês {mes} baixado com sucesso")
 
-                        #criando dataframe para o mês
+                        # Converte a lista retornada pela API em DataFrame.
                         mes_df = pd.DataFrame(data['data']['list'])
                         dfs_do_ano.append(mes_df)
-                        print(f'DataFrame criado com {len(mes_df.columns)} colunas')
+                        registrar_progresso("EXTRACT", f"DataFrame mensal criado com {len(mes_df.columns)} colunas")
 
                         mes_recuperado = True
                         break
                     except requests.exceptions.HTTPError as e:
-                        #tentando novamente caso ocorra erro, tratando 429 de forma diferente dos demais
+                        # Aplica a política de repetição adequada ao status HTTP recebido.
                         status = getattr(e.response, 'status_code', None) if e.response is not None else None
                         ultimo_status = status
 
                         if status == 429:
                             retry_after = e.response.headers.get('Retry-After') if e.response is not None else None
                             espera = int(retry_after) if retry_after else 10 * (tentativas + 1)
-                            print(f'Rate limit (429) no mês {mes} — aguardando {espera}s (tentativa {tentativas+1})')
+                            registrar_progresso("EXTRACT", f"Rate limit (429) no mês {mes}; aguardando {espera}s (tentativa {tentativas+1}/10)", "AVISO")
                             time.sleep(espera)
                         elif status == 500:
-                            #500 é timeout de volume no servidor ("timeout: fullResults") - sem retry,
-                            #parte direto pro particionamento por UF
-                            print(f'Erro 500 no mês {mes} — partindo direto para particionamento por UF (sem retry)')
+                            # Encaminha erros 500 de volume diretamente ao particionamento por bloco.
+                            registrar_progresso("EXTRACT", f"Erro 500 no mês {mes}; iniciando particionamento por bloco sem retry", "AVISO")
                             break
                         else:
                             corpo_erro = None
@@ -232,28 +231,26 @@ def extrair_dados(ano_inicial, ano_final):
                                 except Exception:
                                     corpo_erro = e.response.text[:500]
                             espera = 1 * (tentativas + 1)
-                            print(f'Erro HTTP no mês {mes} (status {status}) — corpo: {corpo_erro} — aguardando {espera}s')
+                            registrar_progresso("EXTRACT", f"Erro HTTP no mês {mes} (status {status}); corpo: {corpo_erro}; aguardando {espera}s", "AVISO")
                             time.sleep(espera)
 
                     except Exception as e:
-                        print(e)
-                        print(f'Erro ao baixar mês {mes}')
+                        registrar_progresso("EXTRACT", f"Erro ao baixar mês {mes}: {e}", "ERRO")
                         break
 
-                #se a consulta cheia falhou com 500 (volume), particiona por bloco econômico mantendo os mesmos details
+                # Particiona por bloco somente quando a consulta mensal completa falha com status 500.
                 if not mes_recuperado and ultimo_status == 500:
                     mes_df = baixar_mes_particionado_por_bloco(ano, mes, DETAILS, METRICS)
                     if mes_df is not None:
                         dfs_do_ano.append(mes_df)
-                        print(f'DataFrame criado com {len(mes_df.columns)} colunas (via particionamento)')
-            print(f'Ano {ano} baixado com sucesso')
+                        registrar_progresso("EXTRACT", f"DataFrame mensal criado com {len(mes_df.columns)} colunas via particionamento")
+            registrar_progresso("EXTRACT", f"Ano {ano} baixado com sucesso")
 
             data = pd.concat(dfs_do_ano, ignore_index=True)
 
-            print(f'DataFrame criado para o ano {ano}')
-            print(data.head())
+            registrar_progresso("EXTRACT", f"DataFrame anual criado para {ano} com {len(data):,} linhas")
 
-            # upload direto do DataFrame para o Supabase
+            # Serializa o DataFrame anual em Parquet e envia para a camada raw.
             buffer = BytesIO()
             data.to_parquet(buffer, index=False)
             buffer.seek(0)
@@ -262,9 +259,9 @@ def extrair_dados(ano_inicial, ano_final):
                 file=buffer.getvalue(),
                 file_options={"content-type": "application/octet-stream", "upsert": "true"}
             )
-            print(f"Arquivo Parquet enviado para o Supabase em: raw/raw_dados_{ano}.parquet")
+            registrar_progresso("EXTRACT", f"Parquet enviado para raw/raw_dados_{ano}.parquet")
 
-            #registrando data e horário que os dados foram armazenados
+            # Registra no bucket de logs os metadados da extração anual.
             data_de_operação = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
             supabase.storage.from_('logs').upload(
@@ -272,15 +269,14 @@ def extrair_dados(ano_inicial, ano_final):
                 file=BytesIO(json.dumps({
                     "ano": ano,
                     "data_de_operação": data_de_operação,
-                    "linhas_totais": len(data), 
+                    "linhas_totais": len(data),
                     "colunas_totais": len(data.columns)
                 }).encode()).getvalue(),
                 file_options={"content-type": "application/json", "upsert": "true"}
             )
-            print(f"Arquivo JSON enviado para o Supabase em: logs/{nome_arquivo_log}")
+            registrar_progresso("EXTRACT", f"JSON enviado para logs/{nome_arquivo_log}")
 
             yield ano, data
 
         except Exception as e:
-            print(e)
-            print(f'Erro ao baixar ano {ano}')
+            registrar_progresso("EXTRACT", f"Erro ao baixar ano {ano}: {e}", "ERRO")
